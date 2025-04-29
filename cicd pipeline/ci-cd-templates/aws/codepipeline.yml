@@ -1,0 +1,408 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for AWS CodePipeline for Node.js applications'
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Description: Name of the source code repository
+  
+  BranchName:
+    Type: String
+    Default: main
+    Description: Branch to use for the pipeline
+  
+  NodejsVersion:
+    Type: String
+    Default: 16
+    AllowedValues:
+      - 14
+      - 16
+      - 18
+      - 20
+    Description: Node.js version to use
+  
+  BuildCommand:
+    Type: String
+    Default: npm run build
+    Description: Command to build the application
+  
+  TestCommand:
+    Type: String
+    Default: npm test
+    Description: Command to test the application
+  
+  ArtifactBucket:
+    Type: String
+    Description: S3 bucket to store pipeline artifacts
+  
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner
+  
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+  
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub OAuth token
+  
+  GitHubWebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: Secret for GitHub webhook
+
+Resources:
+  # IAM Role for CodePipeline
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+
+  # IAM Role for CodeBuild
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonECR-FullAccess'
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+
+  # CodeBuild Project for Linting
+  LintProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${RepositoryName}-lint
+      Description: 'Lint the Node.js application'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Sub aws/codebuild/amazonlinux2-x86_64-standard:${NodejsVersion}.0
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: !Ref NodejsVersion
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run lint || echo "No linting configured"
+          artifacts:
+            files:
+              - '**/*'
+
+  # CodeBuild Project for Testing
+  TestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${RepositoryName}-test
+      Description: 'Test the Node.js application'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Sub aws/codebuild/amazonlinux2-x86_64-standard:${NodejsVersion}.0
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: !Ref NodejsVersion
+              commands:
+                - npm ci
+            build:
+              commands:
+                - !Ref TestCommand
+          artifacts:
+            files:
+              - '**/*'
+            reports:
+              coverage:
+                files:
+                  - coverage/clover.xml
+                file-format: CLOVERXML
+
+  # CodeBuild Project for Building
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${RepositoryName}-build
+      Description: 'Build the Node.js application'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Sub aws/codebuild/amazonlinux2-x86_64-standard:${NodejsVersion}.0
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: !Ref NodejsVersion
+              commands:
+                - npm ci
+            build:
+              commands:
+                - !Ref BuildCommand
+          artifacts:
+            files:
+              - '**/*'
+            base-directory: 'dist'
+
+  # CodeBuild Project for Docker Build
+  DockerBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${RepositoryName}-docker
+      Description: 'Build and push Docker image'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPOSITORY_NAME
+                - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+                - IMAGE_TAG=${COMMIT_HASH:=latest}
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - docker build -t $REPOSITORY_URI:latest .
+                - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker images...
+                - docker push $REPOSITORY_URI:latest
+                - docker push $REPOSITORY_URI:$IMAGE_TAG
+          artifacts:
+            files:
+              - imageDefinitions.json
+              - appspec.yml
+              - taskdef.json
+
+  # CodePipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        # Source Stage
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref BranchName
+                OAuthToken: !Ref GitHubToken
+              OutputArtifacts:
+                - Name: SourceCode
+        
+        # Lint Stage
+        - Name: Lint
+          Actions:
+            - Name: Lint
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref LintProject
+              InputArtifacts:
+                - Name: SourceCode
+        
+        # Test Stage
+        - Name: Test
+          Actions:
+            - Name: Test
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref TestProject
+              InputArtifacts:
+                - Name: SourceCode
+        
+        # Build Stage
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: BuildOutput
+        
+        # Docker Build Stage
+        - Name: DockerBuild
+          Actions:
+            - Name: DockerBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DockerBuildProject
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: DockerBuildOutput
+        
+        # Deploy to Development Stage
+        - Name: DeployToDev
+          Actions:
+            - Name: DeployToDev
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: '1'
+              Configuration:
+                ClusterName: development-cluster
+                ServiceName: nodejs-app-service
+                FileName: imageDefinitions.json
+              InputArtifacts:
+                - Name: DockerBuildOutput
+        
+        # Approval Stage
+        - Name: Approval
+          Actions:
+            - Name: Approval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: "Please review and approve the deployment to staging"
+        
+        # Deploy to Staging Stage
+        - Name: DeployToStaging
+          Actions:
+            - Name: DeployToStaging
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: '1'
+              Configuration:
+                ClusterName: staging-cluster
+                ServiceName: nodejs-app-service
+                FileName: imageDefinitions.json
+              InputArtifacts:
+                - Name: DockerBuildOutput
+        
+        # Production Approval Stage
+        - Name: ProductionApproval
+          Actions:
+            - Name: ProductionApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: "Please review and approve the deployment to production"
+        
+        # Deploy to Production Stage
+        - Name: DeployToProduction
+          Actions:
+            - Name: DeployToProduction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: '1'
+              Configuration:
+                ClusterName: production-cluster
+                ServiceName: nodejs-app-service
+                FileName: imageDefinitions.json
+              InputArtifacts:
+                - Name: DockerBuildOutput
+
+  # GitHub Webhook
+  GitHubWebhook:
+    Type: AWS::CodePipeline::Webhook
+    Properties:
+      Authentication: GITHUB_HMAC
+      AuthenticationConfiguration:
+        SecretToken: !Ref GitHubWebhookSecret
+      Filters:
+        - JsonPath: "$.ref"
+          MatchEquals: refs/heads/{Branch}
+      TargetPipeline: !Ref Pipeline
+      TargetAction: Source
+      Name: !Sub ${RepositoryName}-webhook
+      TargetPipelineVersion: !GetAtt Pipeline.Version
+      RegisterWithThirdParty: true
+
+Outputs:
+  PipelineURL:
+    Description: URL to the CodePipeline console
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}

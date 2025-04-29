@@ -1,0 +1,181 @@
+# GitLab CI/CD Pipeline for Node.js Applications
+
+# Define the stages of the pipeline
+stages:
+  - setup
+  - lint
+  - test
+  - build
+  - docker
+  - deploy_dev
+  - deploy_staging
+  - deploy_prod
+
+# Define variables that will be used throughout the pipeline
+variables:
+  NODE_VERSION: "16"  # Set this to the Node.js version you want to use
+  NPM_CACHE_DIR: "$CI_PROJECT_DIR/.npm"
+  DOCKER_REGISTRY: "${CI_REGISTRY}"
+  DOCKER_IMAGE_NAME: "${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}"
+  DOCKER_IMAGE_LATEST: "${CI_REGISTRY_IMAGE}:latest"
+
+# Cache npm dependencies between jobs
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .npm/
+    - node_modules/
+
+# Setup job - Install dependencies
+setup:
+  stage: setup
+  image: node:${NODE_VERSION}
+  script:
+    - echo "Installing dependencies..."
+    - npm ci --cache $NPM_CACHE_DIR
+  artifacts:
+    paths:
+      - node_modules/
+
+# Lint job - Check code quality
+lint:
+  stage: lint
+  image: node:${NODE_VERSION}
+  script:
+    - echo "Running linting..."
+    - npm run lint || echo "No linting configured"
+  dependencies:
+    - setup
+
+# Test job - Run unit tests
+test:unit:
+  stage: test
+  image: node:${NODE_VERSION}
+  script:
+    - echo "Running unit tests..."
+    - npm test
+  dependencies:
+    - setup
+  artifacts:
+    paths:
+      - coverage/
+    reports:
+      junit: junit.xml
+    when: always
+
+# Test job - Run integration tests
+test:integration:
+  stage: test
+  image: node:${NODE_VERSION}
+  script:
+    - echo "Running integration tests..."
+    - npm run test:integration || echo "No integration tests configured"
+  dependencies:
+    - setup
+  artifacts:
+    paths:
+      - coverage/
+    when: always
+  allow_failure: true  # Integration tests might require external services
+
+# Build job - Build the application
+build:
+  stage: build
+  image: node:${NODE_VERSION}
+  script:
+    - echo "Building application..."
+    - npm run build
+  dependencies:
+    - setup
+  artifacts:
+    paths:
+      - dist/  # Adjust this to your build output directory
+    expire_in: 1 week
+
+# Docker job - Build and push Docker image
+docker:
+  stage: docker
+  image: docker:20.10.16
+  services:
+    - docker:20.10.16-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - echo "Logging in to GitLab Container Registry..."
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - echo "Building Docker image..."
+    - docker build -t $DOCKER_IMAGE_NAME -t $DOCKER_IMAGE_LATEST .
+    - echo "Pushing Docker image..."
+    - docker push $DOCKER_IMAGE_NAME
+    - docker push $DOCKER_IMAGE_LATEST
+  dependencies:
+    - build
+  only:
+    - main
+    - master
+    - tags
+
+# Deploy to development environment
+deploy:dev:
+  stage: deploy_dev
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "Deploying to development environment..."
+    # Add your deployment script here
+    # Examples:
+    # - Deploy to AWS Elastic Beanstalk
+    # - Deploy to Heroku
+    # - Deploy to Azure App Service
+    # - Deploy to Kubernetes
+  environment:
+    name: development
+    url: https://dev.example.com  # Replace with your actual development URL
+  dependencies:
+    - build
+  only:
+    - main
+    - master
+
+# Deploy to staging environment
+deploy:staging:
+  stage: deploy_staging
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "Deploying to staging environment..."
+    # Add your deployment script here
+  environment:
+    name: staging
+    url: https://staging.example.com  # Replace with your actual staging URL
+  dependencies:
+    - build
+  only:
+    - main
+    - master
+  when: manual  # Requires manual approval
+
+# Deploy to production environment
+deploy:prod:
+  stage: deploy_prod
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "Deploying to production environment..."
+    # Add your deployment script here
+  environment:
+    name: production
+    url: https://example.com  # Replace with your actual production URL
+  dependencies:
+    - build
+  only:
+    - main
+    - master
+    - tags
+  when: manual  # Requires manual approval
+  rules:
+    - if: $CI_COMMIT_TAG  # Only deploy to production when a tag is pushed
